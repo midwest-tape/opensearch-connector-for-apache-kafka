@@ -1,6 +1,5 @@
 /*
  * Copyright 2020 Aiven Oy
- * Copyright 2016 Confluent Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package io.aiven.kafka.connect.opensearch;
+
+import static io.aiven.kafka.connect.opensearch.RetryUtil.callWithRetry;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -32,10 +32,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
+import org.apache.kafka.connect.sink.SinkRecord;
 
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
@@ -43,12 +46,10 @@ import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestHighLevelClient;
-import org.opensearch.rest.RestStatus;
+import org.opensearch.core.rest.RestStatus;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static io.aiven.kafka.connect.opensearch.RetryUtil.callWithRetry;
 
 public class BulkProcessor {
 
@@ -77,12 +78,18 @@ public class BulkProcessor {
 
     // shared state, synchronized on (this), may be part of wait() conditions so need notifyAll() on
     // changes
-    private final Deque<DocWriteRequest<?>> unsentRecords;
+    private final Deque<DocWriteWrapper> unsentRecords;
     private int inFlightRecords = 0;
 
-    public BulkProcessor(final Time time,
-                         final RestHighLevelClient client,
-                         final OpensearchSinkConnectorConfig config) {
+    private final ErrantRecordReporter reporter;
+
+    public BulkProcessor(final Time time, final RestHighLevelClient client,
+            final OpensearchSinkConnectorConfig config) {
+        this(time, client, config, null);
+    }
+
+    public BulkProcessor(final Time time, final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
+            final ErrantRecordReporter reporter) {
         this.time = time;
         this.client = client;
 
@@ -93,32 +100,31 @@ public class BulkProcessor {
         this.retryBackoffMs = config.retryBackoffMs();
         this.behaviorOnMalformedDoc = config.behaviorOnMalformedDoc();
         this.behaviorOnVersionConflict = config.behaviorOnVersionConflict();
+        this.reporter = reporter;
 
         unsentRecords = new ArrayDeque<>(maxBufferedRecords);
 
         final ThreadFactory threadFactory = makeThreadFactory();
         farmer = threadFactory.newThread(farmerTask());
         executor = Executors.newFixedThreadPool(config.maxInFlightRequests(), threadFactory);
-        
+
         if (!config.ignoreKey() && config.behaviorOnVersionConflict() == BehaviorOnVersionConflict.FAIL) {
-            LOGGER.warn("The {} is set to `false` which assumes external version and optimistic locking."
-                    + " You may consider changing the configuration property '{}' from '{}' to '{}' or '{}'"
-                    + " to deal with possible version conflicts.",
-                OpensearchSinkConnectorConfig.KEY_IGNORE_CONFIG,
-                OpensearchSinkConnectorConfig.BEHAVIOR_ON_VERSION_CONFLICT_CONFIG,
-                BehaviorOnMalformedDoc.FAIL,
-                BehaviorOnMalformedDoc.IGNORE,
-                BehaviorOnMalformedDoc.WARN);
+            LOGGER.warn(
+                    "The {} is set to `false` which assumes external version and optimistic locking."
+                            + " You may consider changing the configuration property '{}' from '{}' to '{}' or '{}'"
+                            + " to deal with possible version conflicts.",
+                    OpensearchSinkConnectorConfig.KEY_IGNORE_CONFIG,
+                    OpensearchSinkConnectorConfig.BEHAVIOR_ON_VERSION_CONFLICT_CONFIG, BehaviorOnMalformedDoc.FAIL,
+                    BehaviorOnMalformedDoc.IGNORE, BehaviorOnMalformedDoc.WARN);
         }
     }
 
     private ThreadFactory makeThreadFactory() {
         final AtomicInteger threadCounter = new AtomicInteger();
-        final Thread.UncaughtExceptionHandler uncaughtExceptionHandler =
-                (t, e) -> {
-                    LOGGER.error("Uncaught exception in BulkProcessor thread {}", t, e);
-                    failAndStop(e);
-                };
+        final Thread.UncaughtExceptionHandler uncaughtExceptionHandler = (t, e) -> {
+            LOGGER.error("Uncaught exception in BulkProcessor thread {}", t, e);
+            failAndStop(e);
+        };
         return new ThreadFactory() {
             @Override
             public Thread newThread(final Runnable r) {
@@ -148,9 +154,8 @@ public class BulkProcessor {
 
     // Visible for testing
     synchronized Future<BulkResponse> submitBatchWhenReady() throws InterruptedException {
-        for (long waitStartTimeMs = time.milliseconds(), elapsedMs = 0;
-             !stopRequested && !canSubmit(elapsedMs);
-             elapsedMs = time.milliseconds() - waitStartTimeMs) {
+        for (long waitStartTimeMs = time.milliseconds(), elapsedMs = 0; !stopRequested
+                && !canSubmit(elapsedMs); elapsedMs = time.milliseconds() - waitStartTimeMs) {
             // when linger time has already elapsed, we still have to ensure the other submission
             // conditions hence the wait(0) in that case
             wait(Math.max(0, lingerMs - elapsedMs));
@@ -162,7 +167,7 @@ public class BulkProcessor {
     private synchronized Future<BulkResponse> submitBatch() {
         assert !unsentRecords.isEmpty();
         final int batchableSize = Math.min(batchSize, unsentRecords.size());
-        final var batch = new ArrayList<DocWriteRequest<?>>(batchableSize);
+        final var batch = new ArrayList<DocWriteWrapper>(batchableSize);
         for (int i = 0; i < batchableSize; i++) {
             batch.add(unsentRecords.removeFirst());
         }
@@ -193,8 +198,9 @@ public class BulkProcessor {
     /**
      * Initiate shutdown.
      *
-     * <p>Pending buffered records are not automatically flushed, so call {@link #flush(long)} before
-     * this method if this is desirable.
+     * <p>
+     * Pending buffered records are not automatically flushed, so call {@link #flush(long)} before this method if this
+     * is desirable.
      */
     public void stop() {
         LOGGER.trace("stop");
@@ -209,7 +215,8 @@ public class BulkProcessor {
     /**
      * Block upto {@code timeoutMs} till shutdown is complete.
      *
-     * <p>This should only be called after a previous {@link #stop()} invocation.
+     * <p>
+     * This should only be called after a previous {@link #stop()} invocation.
      */
     public void awaitStop(final long timeoutMs) {
         LOGGER.trace("awaitStop {}", timeoutMs);
@@ -273,20 +280,20 @@ public class BulkProcessor {
     }
 
     /**
-     * Add a record, may block upto {@code timeoutMs} if at capacity with respect to
-     * {@code maxBufferedRecords}.
+     * Add a record, may block upto {@code timeoutMs} if at capacity with respect to {@code maxBufferedRecords}.
      *
-     * <p>If any task has failed prior to or while blocked in the add, or if the timeout expires
-     * while blocked, {@link ConnectException} will be thrown.
+     * <p>
+     * If any task has failed prior to or while blocked in the add, or if the timeout expires while blocked,
+     * {@link ConnectException} will be thrown.
      */
-    public synchronized void add(final DocWriteRequest<?> request, final long timeoutMs) {
+    public synchronized void add(final DocWriteRequest<?> docWriteRequests, final SinkRecord sinkRecord,
+            final long timeoutMs) {
         throwIfTerminal();
 
         if (bufferedRecords() >= maxBufferedRecords) {
             final long addStartTimeMs = time.milliseconds();
-            for (long elapsedMs = time.milliseconds() - addStartTimeMs;
-                 !isTerminal() && elapsedMs < timeoutMs && bufferedRecords() >= maxBufferedRecords;
-                 elapsedMs = time.milliseconds() - addStartTimeMs) {
+            for (long elapsedMs = time.milliseconds() - addStartTimeMs; !isTerminal() && elapsedMs < timeoutMs
+                    && bufferedRecords() >= maxBufferedRecords; elapsedMs = time.milliseconds() - addStartTimeMs) {
                 try {
                     wait(timeoutMs - elapsedMs);
                 } catch (final InterruptedException e) {
@@ -299,15 +306,15 @@ public class BulkProcessor {
             }
         }
 
-        unsentRecords.addLast(request);
+        unsentRecords.addLast(new DocWriteWrapper(docWriteRequests, sinkRecord));
         notifyAll();
     }
 
     /**
      * Request a flush and block upto {@code timeoutMs} until all pending records have been flushed.
      *
-     * <p>If any task has failed prior to or during the flush, {@link ConnectException} will be
-     * thrown with that error.
+     * <p>
+     * If any task has failed prior to or during the flush, {@link ConnectException} will be thrown with that error.
      */
     public void flush(final long timeoutMs) {
         LOGGER.trace("flush {}", timeoutMs);
@@ -316,15 +323,13 @@ public class BulkProcessor {
             flushRequested = true;
             synchronized (this) {
                 notifyAll();
-                for (long elapsedMs = time.milliseconds() - flushStartTimeMs;
-                     !isTerminal() && elapsedMs < timeoutMs && bufferedRecords() > 0;
-                     elapsedMs = time.milliseconds() - flushStartTimeMs) {
+                for (long elapsedMs = time.milliseconds() - flushStartTimeMs; !isTerminal() && elapsedMs < timeoutMs
+                        && bufferedRecords() > 0; elapsedMs = time.milliseconds() - flushStartTimeMs) {
                     wait(timeoutMs - elapsedMs);
                 }
                 throwIfTerminal();
                 if (bufferedRecords() > 0) {
-                    throw new ConnectException("Flush timeout expired with unflushed records: "
-                            + bufferedRecords());
+                    throw new ConnectException("Flush timeout expired with unflushed records: " + bufferedRecords());
                 }
             }
         } catch (final InterruptedException e) {
@@ -338,13 +343,13 @@ public class BulkProcessor {
 
         final long batchId = BATCH_ID_GEN.incrementAndGet();
 
-        final List<DocWriteRequest<?>> batch;
+        final List<DocWriteWrapper> batch;
 
         final int maxRetries;
 
         final long retryBackoffMs;
 
-        BulkTask(final List<DocWriteRequest<?>> batch, final int maxRetries, final long retryBackoffMs) {
+        BulkTask(final List<DocWriteWrapper> batch, final int maxRetries, final long retryBackoffMs) {
             this.batch = batch;
             this.maxRetries = maxRetries;
             this.retryBackoffMs = retryBackoffMs;
@@ -363,11 +368,29 @@ public class BulkProcessor {
             }
         }
 
+        private void sendToErrantRecordReporter(final String errorMessage, final SinkRecord batchRecord) {
+            LOGGER.debug(errorMessage);
+            reporter.report(batchRecord, new Exception(errorMessage));
+        }
+
         private BulkResponse execute() throws Exception {
+            class RetriableError extends RuntimeException {
+                private static final long serialVersionUID = 1L;
+
+                public RetriableError(final String errorMessage) {
+                    super(errorMessage);
+                }
+
+                public RetriableError(final Throwable cause) {
+                    super(cause);
+                }
+            }
+
             return callWithRetry("bulk processing", () -> {
                 try {
-                    final var response =
-                            client.bulk(new BulkRequest().add(batch), RequestOptions.DEFAULT);
+                    final var response = client.bulk(new BulkRequest()
+                            .add(batch.stream().map(DocWriteWrapper::getDocWriteRequest).collect(Collectors.toList())),
+                            RequestOptions.DEFAULT);
                     if (!response.hasFailures()) {
                         // We only logged failures, so log the success immediately after a failure ...
                         LOGGER.debug("Completed batch {} of {} records", batchId, batch.size());
@@ -381,52 +404,60 @@ public class BulkProcessor {
                                 } else if (responseContainsVersionConflict(itemResponse)) {
                                     handleVersionConflict(itemResponse);
                                 } else {
-                                    throw new RuntimeException(
-                                            "One of the item in the bulk response failed. Reason: "
+                                    throw new RetriableError("One of the item in the bulk response failed. Reason: "
                                             + itemResponse.getFailureMessage());
                                 }
                             } else {
-                                throw new ConnectException(
-                                        "One of the item in the bulk response aborted. Reason: "
+                                throw new ConnectException("One of the item in the bulk response aborted. Reason: "
                                         + itemResponse.getFailureMessage());
                             }
                         }
                     }
                     return response;
                 } catch (final IOException e) {
-                    LOGGER.error(
-                            "Failed to send bulk request from batch {} of {} records", batchId, batch.size(), e);
-                    throw new ConnectException(e);
+                    LOGGER.error("Failed to send bulk request from batch {} of {} records", batchId, batch.size(), e);
+                    throw new RetriableError(e);
                 }
-            }, maxRetries, retryBackoffMs, RuntimeException.class);
+            }, maxRetries, retryBackoffMs, RetriableError.class);
         }
 
         private void handleVersionConflict(final BulkItemResponse bulkItemResponse) {
             // if the elasticsearch request failed because of a version conflict,
             // the behavior is configurable.
             switch (behaviorOnVersionConflict) {
-                case IGNORE:
-                    LOGGER.debug("Encountered a version conflict when executing batch {} of {}"
+                case IGNORE :
+                    LOGGER.debug(
+                            "Encountered a version conflict when executing batch {} of {}"
                                     + " records. Ignoring and will keep an existing record. Error was {}",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage());
                     break;
-                case WARN:
-                    LOGGER.warn("Encountered a version conflict when executing batch {} of {}"
+                case REPORT :
+                    final String errorMessage = String.format(
+                            "Encountered a version conflict when executing batch %s of %s"
+                                    + " records. Reporting this error to the errant record reporter and will"
+                                    + " keep an existing record."
+                                    + " Rest status: %s, Action id: %s, Error message: %s",
+                            batchId, batch.size(), bulkItemResponse.getFailure().getStatus(),
+                            bulkItemResponse.getFailure().getId(), bulkItemResponse.getFailureMessage());
+                    sendToErrantRecordReporter(errorMessage, batch.get(bulkItemResponse.getItemId()).getSinkRecord());
+                    break;
+                case WARN :
+                    LOGGER.warn(
+                            "Encountered a version conflict when executing batch {} of {}"
                                     + " records. Ignoring and will keep an existing record. Error was {}",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage());
                     break;
-                case FAIL:
-                default:
-                    LOGGER.error("Encountered a version conflict when executing batch {} of {}"
+                case FAIL :
+                default :
+                    LOGGER.error(
+                            "Encountered a version conflict when executing batch {} of {}"
                                     + " records. Error was {} (to ignore version conflicts you may consider"
                                     + " changing the configuration property '{}' from '{}' to '{}').",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage(),
                             OpensearchSinkConnectorConfig.BEHAVIOR_ON_VERSION_CONFLICT_CONFIG,
-                            BehaviorOnMalformedDoc.FAIL,
-                            BehaviorOnMalformedDoc.IGNORE);
-                    throw new ConnectException(
-                            "One of the item in the bulk response failed. Reason: "
-                                    + bulkItemResponse.getFailureMessage());
+                            BehaviorOnMalformedDoc.FAIL, BehaviorOnMalformedDoc.IGNORE);
+                    throw new ConnectException("One of the item in the bulk response failed. Reason: "
+                            + bulkItemResponse.getFailureMessage());
             }
         }
 
@@ -434,30 +465,61 @@ public class BulkProcessor {
             // if the elasticsearch request failed because of a malformed document,
             // the behavior is configurable.
             switch (behaviorOnMalformedDoc) {
-                case IGNORE:
-                    LOGGER.debug("Encountered an illegal document error when executing batch {} of {}"
+                case IGNORE :
+                    LOGGER.debug(
+                            "Encountered an illegal document error when executing batch {} of {}"
                                     + " records. Ignoring and will not index record. Error was {}",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage());
                     break;
-                case WARN:
-                    LOGGER.warn("Encountered an illegal document error when executing batch {} of {}"
+                case REPORT :
+                    final String errorMessage = String.format(
+                            "Encountered a version conflict when executing batch %s of %s"
+                                    + " records. Reporting this error to the errant record reporter"
+                                    + " and will not index record."
+                                    + " Rest status: %s, Action id: %s, Error message: %s",
+                            batchId, batch.size(), bulkItemResponse.getFailure().getStatus(),
+                            bulkItemResponse.getFailure().getId(), bulkItemResponse.getFailureMessage());
+                    sendToErrantRecordReporter(errorMessage, batch.get(bulkItemResponse.getItemId()).getSinkRecord());
+                    break;
+                case WARN :
+                    LOGGER.warn(
+                            "Encountered an illegal document error when executing batch {} of {}"
                                     + " records. Ignoring and will not index record. Error was {}",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage());
                     break;
-                case FAIL:
-                default:
-                    LOGGER.error("Encountered an illegal document error when executing batch {} of {}"
+                case FAIL :
+                default :
+                    LOGGER.error(
+                            "Encountered an illegal document error when executing batch {} of {}"
                                     + " records. Error was {} (to ignore future records like this"
                                     + " change the configuration property '{}' from '{}' to '{}').",
                             batchId, batch.size(), bulkItemResponse.getFailureMessage(),
                             OpensearchSinkConnectorConfig.BEHAVIOR_ON_MALFORMED_DOCS_CONFIG,
-                            BehaviorOnMalformedDoc.FAIL,
-                            BehaviorOnMalformedDoc.IGNORE);
+                            BehaviorOnMalformedDoc.FAIL, BehaviorOnMalformedDoc.IGNORE);
                     throw new ConnectException("Bulk request failed: " + bulkItemResponse.getFailureMessage());
             }
         }
     }
-    
+
+    private static final class DocWriteWrapper {
+
+        private final DocWriteRequest<?> docWriteRequest;
+        private final SinkRecord sinkRecord;
+
+        DocWriteWrapper(final DocWriteRequest<?> docWriteRequests, final SinkRecord sinkRecord) {
+            this.docWriteRequest = docWriteRequests;
+            this.sinkRecord = sinkRecord;
+        }
+
+        public DocWriteRequest<?> getDocWriteRequest() {
+            return docWriteRequest;
+        }
+
+        public SinkRecord getSinkRecord() {
+            return sinkRecord;
+        }
+    }
+
     private boolean responseContainsVersionConflict(final BulkItemResponse bulkItemResponse) {
         return bulkItemResponse.getFailure().getStatus() == RestStatus.CONFLICT
                 || bulkItemResponse.getFailureMessage().contains("version_conflict_engine_exception");
@@ -497,9 +559,7 @@ public class BulkProcessor {
     }
 
     public enum BehaviorOnMalformedDoc {
-        IGNORE,
-        WARN,
-        FAIL;
+        IGNORE, WARN, FAIL, REPORT;
 
         public static final BehaviorOnMalformedDoc DEFAULT = FAIL;
 
@@ -545,11 +605,9 @@ public class BulkProcessor {
             return name().toLowerCase(Locale.ROOT);
         }
     }
-    
+
     public enum BehaviorOnVersionConflict {
-        IGNORE,
-        WARN,
-        FAIL;
+        IGNORE, WARN, FAIL, REPORT;
 
         public static final BehaviorOnVersionConflict DEFAULT = FAIL;
 

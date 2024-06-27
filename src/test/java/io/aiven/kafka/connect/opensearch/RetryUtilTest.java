@@ -1,6 +1,5 @@
 /*
  * Copyright 2020 Aiven Oy
- * Copyright 2017 Confluent Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package io.aiven.kafka.connect.opensearch;
 
-import org.junit.jupiter.api.Test;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+
+import org.apache.kafka.connect.errors.ConnectException;
+
+import org.junit.jupiter.api.Test;
 
 public class RetryUtilTest {
 
@@ -47,6 +50,49 @@ public class RetryUtilTest {
         assertEquals(800L, RetryUtil.computeRetryWaitTimeInMillis(3, 100L));
         assertEquals(1600L, RetryUtil.computeRetryWaitTimeInMillis(4, 100L));
         assertEquals(3200L, RetryUtil.computeRetryWaitTimeInMillis(5, 100L));
+    }
+
+    @Test
+    public void callWithRetryRetriableError() {
+        final int[] attempt = new int[1];
+        final int maxRetries = 3;
+        final int res = RetryUtil.callWithRetry("test callWithRetryRetriableError", () -> {
+            if (attempt[0] < maxRetries) {
+                ++attempt[0];
+                throw new ArithmeticException();
+            }
+            return attempt[0];
+        }, maxRetries, 1L, RuntimeException.class);
+
+        assertEquals(maxRetries, res);
+    }
+
+    @Test
+    public void callWithRetryMaxRetries() {
+        final int[] attempt = new int[1];
+        final int maxRetries = 3;
+        assertThrows(ConnectException.class, () -> {
+            RetryUtil.callWithRetry("test callWithRetryMaxRetries", () -> {
+                ++attempt[0];
+                throw new ArithmeticException();
+            }, maxRetries, 1L, RuntimeException.class);
+        });
+
+        assertEquals(maxRetries + 1, attempt[0]);
+    }
+
+    @Test
+    public void callWithRetryNonRetriableError() {
+        final int[] attempt = new int[1];
+        final int maxRetries = 3;
+        assertThrows(ConnectException.class, () -> {
+            RetryUtil.callWithRetry("test callWithRetryNonRetriableError", () -> {
+                ++attempt[0];
+                throw new ArithmeticException();
+            }, maxRetries, 1L, IOException.class);
+        });
+
+        assertEquals(1, attempt[0]);
     }
 
     protected void assertComputeRetryInRange(final int retryAttempts, final long retryBackoffMs) {
